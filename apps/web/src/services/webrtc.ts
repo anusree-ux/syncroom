@@ -11,6 +11,7 @@ export function createPeerConnection(
   callbacks: WebRTCCallbacks,
 ): RTCPeerConnection {
   const peerConnection = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  const receivedStream = new MediaStream();
 
   peerConnection.onicecandidate = (event) => {
     if (event.candidate) callbacks.onIceCandidate(event.candidate.toJSON());
@@ -18,7 +19,15 @@ export function createPeerConnection(
 
   peerConnection.ontrack = (event) => {
     const stream = event.streams[0];
-    if (stream) callbacks.onTrack(stream);
+    if (stream) {
+      callbacks.onTrack(stream);
+      return;
+    }
+
+    if (!receivedStream.getTracks().some((track) => track.id === event.track.id)) {
+      receivedStream.addTrack(event.track);
+    }
+    callbacks.onTrack(receivedStream);
   };
 
   return peerConnection;

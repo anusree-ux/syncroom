@@ -1,5 +1,18 @@
 import { useEffect, useRef, useState, type ChangeEvent } from "react";
-import { connectToRoom, type RoomEvent } from "./services/socket";
+import {
+  connectToRoom,
+  sendWebRTCSignal,
+  type RoomEvent,
+  type WebRTCSignalMessage,
+} from "./services/socket";
+import {
+  acceptAnswer,
+  acceptOffer,
+  addIceCandidate,
+  createAnswer,
+  createOffer,
+  createPeerConnection,
+} from "./services/webrtc";
 import "./App.css";
 
 const API_URL = "http://localhost:5000";
@@ -7,6 +20,10 @@ const API_URL = "http://localhost:5000";
 type Participant = {
   id: string;
   name: string;
+};
+
+type VideoElementWithCaptureStream = HTMLVideoElement & {
+  captureStream?: () => MediaStream;
 };
 
 type RoomResponse = {
@@ -45,32 +62,153 @@ function App() {
   const [participants, setParticipants] = useState<Participant[]>([]);
   const [selectedVideo, setSelectedVideo] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
   const [message, setMessage] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
   const socketRef = useRef<WebSocket | null>(null);
   const videoUrlRef = useRef<string | null>(null);
+  const isHostRef = useRef(false);
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const peerParticipantIdRef = useRef<string | null>(null);
+  const pendingIceCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const capturedStreamRef = useRef<MediaStream | null>(null);
+  const localVideoRef = useRef<HTMLVideoElement | null>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+
+  const closePeerConnection = (clearRemoteStream = true) => {
+    peerConnectionRef.current?.close();
+    peerConnectionRef.current = null;
+    peerParticipantIdRef.current = null;
+    pendingIceCandidatesRef.current = [];
+    if (clearRemoteStream) setRemoteStream(null);
+  };
 
   useEffect(() => () => {
     socketRef.current?.close();
+    peerConnectionRef.current?.close();
+    capturedStreamRef.current?.getTracks().forEach((track) => track.stop());
     if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current);
   }, []);
+
+  useEffect(() => {
+    const video = remoteVideoRef.current;
+    if (!video) return;
+
+    video.srcObject = remoteStream;
+    if (remoteStream) {
+      void video.play().catch((error: unknown) => {
+        console.error("Could not play the remote video stream:", error);
+      });
+    }
+
+    return () => {
+      video.srcObject = null;
+    };
+  }, [remoteStream]);
 
   const enterRoom = (
     roomId: string,
     participantId: string,
     participantName: string,
     roster: Participant[],
+    host: boolean,
   ) => {
     const self = { id: participantId, name: participantName };
     setActiveRoom(roomId);
-    setIsHost(false);
+    setIsHost(host);
+    isHostRef.current = host;
     setCurrentParticipant(self);
     setParticipants(roster.some((participant) => participant.id === participantId)
       ? roster
       : [...roster, self]);
     setMessage("");
     setIsConnected(false);
+
+    const sendSignal = (signal: WebRTCSignalMessage) => {
+      const socket = socketRef.current;
+      if (!socket) throw new Error("Room connection is not available.");
+      sendWebRTCSignal(socket, signal);
+    };
+
+    const createPeer = (remoteParticipantId: string, preservePendingIce = false) => {
+      const peerConnection = createPeerConnection({
+        onIceCandidate: (candidate) => {
+          try {
+            sendSignal({ type: "webrtc:ice-candidate", candidate });
+          } catch (error) {
+            console.error("Could not send WebRTC ICE candidate:", error);
+            setMessage("Couldn't send a video connection candidate.");
+          }
+        },
+        onTrack: (stream) => {
+          if (!isHostRef.current) setRemoteStream(stream);
+        },
+      });
+      peerConnectionRef.current = peerConnection;
+      peerParticipantIdRef.current = remoteParticipantId;
+      if (!preservePendingIce) pendingIceCandidatesRef.current = [];
+      return peerConnection;
+    };
+
+    const addPendingIceCandidates = async (peerConnection: RTCPeerConnection) => {
+      const candidates = pendingIceCandidatesRef.current;
+      pendingIceCandidatesRef.current = [];
+      for (const candidate of candidates) {
+        await addIceCandidate(peerConnection, candidate);
+      }
+    };
+
+    const startHostOffer = async (remoteParticipantId: string) => {
+      if (peerConnectionRef.current) return;
+      const peerConnection = createPeer(remoteParticipantId);
+      peerConnection.addTransceiver("video", { direction: "sendonly" });
+      peerConnection.addTransceiver("audio", { direction: "sendonly" });
+
+      const capturedStream = capturedStreamRef.current;
+      if (capturedStream) {
+        for (const track of capturedStream.getTracks()) {
+          const transceiver = peerConnection.getTransceivers().find(
+            (candidate) => candidate.receiver.track.kind === track.kind,
+          );
+          if (transceiver) await transceiver.sender.replaceTrack(track);
+        }
+      }
+
+      const offer = await createOffer(peerConnection);
+      sendSignal({ type: "webrtc:offer", offer });
+    };
+
+    const handleWebRTCEvent = async (event: RoomEvent) => {
+      if (event.type === "webrtc:offer" && !isHostRef.current && event.offer) {
+        const remoteParticipantId = event.fromParticipantId;
+        if (!remoteParticipantId) throw new Error("WebRTC offer has no sender ID.");
+        if (peerConnectionRef.current && peerParticipantIdRef.current !== remoteParticipantId) return;
+        const peerConnection = peerConnectionRef.current ?? createPeer(remoteParticipantId, true);
+        await acceptOffer(peerConnection, event.offer);
+        await addPendingIceCandidates(peerConnection);
+        const answer = await createAnswer(peerConnection);
+        sendSignal({ type: "webrtc:answer", answer });
+      } else if (event.type === "webrtc:answer" && isHostRef.current && event.answer) {
+        const peerConnection = peerConnectionRef.current;
+        if (!peerConnection) return;
+        await acceptAnswer(peerConnection, event.answer);
+        await addPendingIceCandidates(peerConnection);
+      } else if (event.type === "webrtc:ice-candidate" && event.candidate) {
+        if (
+          event.fromParticipantId &&
+          peerParticipantIdRef.current &&
+          event.fromParticipantId !== peerParticipantIdRef.current
+        ) return;
+
+        const peerConnection = peerConnectionRef.current;
+        if (!peerConnection?.remoteDescription) {
+          pendingIceCandidatesRef.current.push(event.candidate);
+        } else {
+          await addIceCandidate(peerConnection, event.candidate);
+        }
+      }
+    };
 
     socketRef.current = connectToRoom(
       roomId,
@@ -87,10 +225,24 @@ function App() {
           setParticipants((current) => current.some((participant) => participant.id === joined.id)
             ? current
             : [...current, joined]);
+          if (isHostRef.current && !peerConnectionRef.current) {
+            void startHostOffer(joined.id).catch((error: unknown) => {
+              console.error("Could not start WebRTC offer:", error);
+              setMessage(error instanceof Error ? error.message : "Couldn't start the video connection.");
+            });
+          }
         }
 
         if (event.type === "participant:left" && typeof event.participantId === "string") {
           setParticipants((current) => current.filter((participant) => participant.id !== event.participantId));
+          if (peerParticipantIdRef.current === event.participantId) closePeerConnection();
+        }
+
+        if (event.type.startsWith("webrtc:")) {
+          void handleWebRTCEvent(event).catch((error: unknown) => {
+            console.error("WebRTC signaling failed:", error);
+            setMessage(error instanceof Error ? error.message : "The video connection failed.");
+          });
         }
       },
     );
@@ -108,8 +260,7 @@ function App() {
       const roomParticipants = Array.isArray(data.room.participants)
         ? data.room.participants.filter(isParticipant)
         : [];
-      enterRoom(data.room.id, data.participantId, "Host", roomParticipants);
-      setIsHost(data.room.hostId === data.participantId);
+      enterRoom(data.room.id, data.participantId, "Host", roomParticipants, true);
     } catch (error) {
       console.error(error);
       setMessage(error instanceof Error ? error.message : "Could not create room.");
@@ -143,8 +294,7 @@ function App() {
       const roomParticipants = Array.isArray(data.room.participants)
         ? data.room.participants.filter(isParticipant)
         : [];
-      enterRoom(data.room.id, data.participantId, name.trim(), roomParticipants);
-      setIsHost(data.room.hostId === data.participantId);
+      enterRoom(data.room.id, data.participantId, name.trim(), roomParticipants, false);
     } catch (error) {
       console.error(error);
       setMessage(error instanceof Error ? error.message : "Could not join room.");
@@ -167,12 +317,16 @@ function App() {
   const leaveRoom = () => {
     socketRef.current?.close();
     socketRef.current = null;
+    closePeerConnection();
+    capturedStreamRef.current?.getTracks().forEach((track) => track.stop());
+    capturedStreamRef.current = null;
     if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current);
     videoUrlRef.current = null;
     setVideoUrl(null);
     setSelectedVideo(null);
     setActiveRoom(null);
     setIsHost(false);
+    isHostRef.current = false;
     setCurrentParticipant(null);
     setParticipants([]);
     setIsConnected(false);
@@ -189,6 +343,18 @@ function App() {
       return;
     }
 
+    const peerConnection = peerConnectionRef.current;
+    if (peerConnection) {
+      for (const transceiver of peerConnection.getTransceivers()) {
+        if (transceiver.sender.track) {
+          void transceiver.sender.replaceTrack(null).catch((error: unknown) => {
+            console.error("Could not replace the shared video track:", error);
+          });
+        }
+      }
+    }
+    capturedStreamRef.current?.getTracks().forEach((track) => track.stop());
+    capturedStreamRef.current = null;
     if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current);
     const url = URL.createObjectURL(file);
     videoUrlRef.current = url;
@@ -198,10 +364,48 @@ function App() {
   };
 
   const clearVideo = () => {
+    const peerConnection = peerConnectionRef.current;
+    if (peerConnection) {
+      for (const transceiver of peerConnection.getTransceivers()) {
+        if (transceiver.sender.track) {
+          void transceiver.sender.replaceTrack(null).catch((error: unknown) => {
+            console.error("Could not stop sharing the video track:", error);
+          });
+        }
+      }
+    }
+    capturedStreamRef.current?.getTracks().forEach((track) => track.stop());
+    capturedStreamRef.current = null;
     if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current);
     videoUrlRef.current = null;
     setVideoUrl(null);
     setSelectedVideo(null);
+  };
+
+  const captureHostVideo = async () => {
+    const video = localVideoRef.current;
+    if (!video || !isHostRef.current) return;
+    const capturableVideo = video as VideoElementWithCaptureStream;
+    if (!capturableVideo.captureStream) {
+      setMessage("Your browser doesn't support sharing video playback.");
+      return;
+    }
+
+    try {
+      const stream = capturableVideo.captureStream();
+      capturedStreamRef.current = stream;
+      const peerConnection = peerConnectionRef.current;
+      if (!peerConnection) return;
+      for (const track of stream.getTracks()) {
+        const transceiver = peerConnection.getTransceivers().find(
+          (candidate) => candidate.receiver.track.kind === track.kind,
+        );
+        if (transceiver) await transceiver.sender.replaceTrack(track);
+      }
+    } catch (error) {
+      console.error("Could not capture the selected video stream:", error);
+      setMessage("This browser couldn't share the selected video's playback.");
+    }
   };
 
   return (
@@ -312,23 +516,34 @@ function App() {
           <div className="watch-layout">
             <section className="watch-column">
               <div className="player-frame">
-                {videoUrl ? (
+                {isHost && videoUrl ? (
                   <>
                     <video
+                      ref={localVideoRef}
                       src={videoUrl}
                       controls
                       playsInline
                       preload="metadata"
+                      onPlay={() => void captureHostVideo()}
                       aria-label={`Selected video: ${selectedVideo?.name ?? "local video"}`}
                       style={{ width: "100%", height: "100%", position: "absolute", inset: 0, objectFit: "contain", background: "#08080d" }}
                     />
-                    {isHost && selectedVideo && (
+                    {selectedVideo && (
                       <div style={{ position: "absolute", zIndex: 2, top: 16, right: 16, left: 16, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "8px 10px", border: "1px solid rgba(255,255,255,.12)", borderRadius: 8, background: "rgba(13,13,18,.82)" }}>
                         <span title={selectedVideo.name} style={{ minWidth: 0, overflow: "hidden", color: "#eeeaf5", fontSize: 11, textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{selectedVideo.name}</span>
                         <button className="invite-button" style={{ width: "auto", flex: "0 0 auto", margin: 0, padding: "7px 10px" }} onClick={clearVideo}>Clear video</button>
                       </div>
                     )}
                   </>
+                ) : !isHost && remoteStream ? (
+                  <video
+                    ref={remoteVideoRef}
+                    autoPlay
+                    controls
+                    playsInline
+                    aria-label="Video shared by the host"
+                    style={{ width: "100%", height: "100%", position: "absolute", inset: 0, objectFit: "contain", background: "#08080d" }}
+                  />
                 ) : (
                   <>
                     <div className="player-vignette" />
