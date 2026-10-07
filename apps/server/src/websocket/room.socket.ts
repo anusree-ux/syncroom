@@ -64,6 +64,22 @@ export async function roomSocket(app: FastifyInstance) {
                 );
               }
             }
+          } else if (
+            participant &&
+            (data.type === "webrtc:offer" ||
+              data.type === "webrtc:answer" ||
+              data.type === "webrtc:ice-candidate")
+          ) {
+            const signal = JSON.stringify({
+              ...data,
+              fromParticipantId: participant.participantId,
+            });
+
+            for (const client of connections) {
+              if (client.socket !== socket && client.socket.readyState === 1) {
+                client.socket.send(signal);
+              }
+            }
           }
         } catch {
           console.error("Invalid WebSocket message");
