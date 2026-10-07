@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { connectToRoom } from "./services/socket";
 import "./App.css";
 
 const API_URL = "http://localhost:5000";
@@ -25,6 +26,15 @@ function App() {
 
       setCreatedRoom(data.room.id);
       setMessage("Room created successfully!");
+
+      connectToRoom(
+        data.room.id,
+        data.participantId,
+        "Host",
+        (event) => {     
+          console.log("Room event:", event);
+        }
+      );
     } catch (error) {
       console.error(error);
       setMessage("Could not create room.");
@@ -45,8 +55,10 @@ function App() {
     try {
       setMessage("Joining room...");
 
+      const code = roomCode.trim().toUpperCase();
+
       const response = await fetch(
-        `${API_URL}/api/rooms/${roomCode.trim().toUpperCase()}/join`,
+        `${API_URL}/api/rooms/${code}/join`,
         {
           method: "POST",
           headers: {
@@ -65,10 +77,22 @@ function App() {
       }
 
       setMessage(`Joined room ${data.room.id} successfully!`);
+
+      connectToRoom(
+        data.room.id,
+        data.participantId,
+        name.trim(),
+        (event) => {
+          console.log("Room event:", event);
+        }
+      );
     } catch (error) {
       console.error(error);
+
       setMessage(
-        error instanceof Error ? error.message : "Could not join room."
+        error instanceof Error
+          ? error.message
+          : "Could not join room."
       );
     }
   };

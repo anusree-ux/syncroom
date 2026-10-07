@@ -2,6 +2,8 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import "dotenv/config";
 
+import websocket from "@fastify/websocket";
+import { roomSocket } from "./websocket/room.socket.js";
 import { roomRoutes } from "./modules/rooms/room.routes.js";
 
 const app = Fastify({
@@ -11,8 +13,10 @@ const app = Fastify({
 await app.register(cors, {
   origin: true,
 });
+await app.register(websocket);
 
 await app.register(roomRoutes);
+await app.register(roomSocket);
 
 app.get("/health", async () => {
   return {

@@ -22,6 +22,7 @@
   "type": "module",
   "dependencies": {
     "@fastify/cors": "^11.3.0",
+    "@fastify/websocket": "^11.3.3",
     "dotenv": "^18.0.5",
     "fastify": "^5.12.5"
   },
