@@ -22,6 +22,11 @@ type Participant = {
   name: string;
 };
 
+type PendingPlaybackState = {
+  isPlaying?: boolean;
+  currentTime?: number;
+};
+
 type VideoElementWithCaptureStream = HTMLVideoElement & {
   captureStream?: () => MediaStream;
 };
@@ -75,13 +80,67 @@ function App() {
   const capturedStreamRef = useRef<MediaStream | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const pendingPlaybackRef = useRef<PendingPlaybackState>({});
+
+  const applyRemotePlayback = () => {
+    const video = remoteVideoRef.current;
+    if (!video) return;
+
+    const playback = pendingPlaybackRef.current;
+    if (
+      typeof playback.currentTime === "number" &&
+      video.readyState >= HTMLMediaElement.HAVE_METADATA
+    ) {
+      video.currentTime = playback.currentTime;
+      delete playback.currentTime;
+    }
+
+    if (playback.isPlaying === true) {
+      void video.play().catch((error: unknown) => {
+        console.error("Could not play the synchronized video:", error);
+        setMessage("Press play on the video to allow synchronized playback.");
+      });
+    } else if (playback.isPlaying === false) {
+      video.pause();
+    } else {
+      void video.play().catch((error: unknown) => {
+        console.error("Could not autoplay the remote video stream:", error);
+      });
+    }
+  };
+
+  const sendHostPlaybackEvent = (
+    type: "playback:play" | "playback:pause" | "playback:seek",
+    currentTime?: number,
+  ) => {
+    if (!isHostRef.current) return;
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      console.error(`Could not send ${type}: room connection is not open.`);
+      setMessage("Playback could not sync because the room connection is unavailable.");
+      return;
+    }
+
+    const event = type === "playback:seek"
+      ? { type, currentTime }
+      : { type };
+    try {
+      socket.send(JSON.stringify(event));
+    } catch (error) {
+      console.error(`Could not send ${type}:`, error);
+      setMessage("Playback could not sync because the room connection failed.");
+    }
+  };
 
   const closePeerConnection = (clearRemoteStream = true) => {
     peerConnectionRef.current?.close();
     peerConnectionRef.current = null;
     peerParticipantIdRef.current = null;
     pendingIceCandidatesRef.current = [];
-    if (clearRemoteStream) setRemoteStream(null);
+    if (clearRemoteStream) {
+      pendingPlaybackRef.current = {};
+      setRemoteStream(null);
+    }
   };
 
   useEffect(() => () => {
@@ -96,13 +155,11 @@ function App() {
     if (!video) return;
 
     video.srcObject = remoteStream;
-    if (remoteStream) {
-      void video.play().catch((error: unknown) => {
-        console.error("Could not play the remote video stream:", error);
-      });
-    }
+    video.addEventListener("loadedmetadata", applyRemotePlayback);
+    applyRemotePlayback();
 
     return () => {
+      video.removeEventListener("loadedmetadata", applyRemotePlayback);
       video.srcObject = null;
     };
   }, [remoteStream]);
@@ -236,6 +293,26 @@ function App() {
         if (event.type === "participant:left" && typeof event.participantId === "string") {
           setParticipants((current) => current.filter((participant) => participant.id !== event.participantId));
           if (peerParticipantIdRef.current === event.participantId) closePeerConnection();
+        }
+
+        if (!isHostRef.current) {
+          if (event.type === "playback:play") {
+            pendingPlaybackRef.current = { ...pendingPlaybackRef.current, isPlaying: true };
+            applyRemotePlayback();
+          } else if (event.type === "playback:pause") {
+            pendingPlaybackRef.current = { ...pendingPlaybackRef.current, isPlaying: false };
+            applyRemotePlayback();
+          } else if (
+            event.type === "playback:seek" &&
+            typeof event.currentTime === "number" &&
+            Number.isFinite(event.currentTime)
+          ) {
+            pendingPlaybackRef.current = {
+              ...pendingPlaybackRef.current,
+              currentTime: event.currentTime,
+            };
+            applyRemotePlayback();
+          }
         }
 
         if (event.type.startsWith("webrtc:")) {
@@ -524,7 +601,12 @@ function App() {
                       controls
                       playsInline
                       preload="metadata"
-                      onPlay={() => void captureHostVideo()}
+                      onPlay={() => {
+                        sendHostPlaybackEvent("playback:play");
+                        void captureHostVideo();
+                      }}
+                      onPause={() => sendHostPlaybackEvent("playback:pause")}
+                      onSeeked={(event) => sendHostPlaybackEvent("playback:seek", event.currentTarget.currentTime)}
                       aria-label={`Selected video: ${selectedVideo?.name ?? "local video"}`}
                       style={{ width: "100%", height: "100%", position: "absolute", inset: 0, objectFit: "contain", background: "#08080d" }}
                     />
