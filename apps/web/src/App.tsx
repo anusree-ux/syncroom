@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ChangeEvent } from "react";
 import { connectToRoom, type RoomEvent } from "./services/socket";
 import "./App.css";
 
@@ -12,6 +12,7 @@ type Participant = {
 type RoomResponse = {
   room: {
     id: string;
+    hostId?: string;
     participants?: Array<{ id: string; name: string }>;
   };
   participantId: string;
@@ -39,14 +40,21 @@ function App() {
   const [roomCode, setRoomCode] = useState("");
   const [name, setName] = useState("");
   const [activeRoom, setActiveRoom] = useState<string | null>(null);
+  const [isHost, setIsHost] = useState(false);
   const [currentParticipant, setCurrentParticipant] = useState<Participant | null>(null);
   const [participants, setParticipants] = useState<Participant[]>([]);
+  const [selectedVideo, setSelectedVideo] = useState<File | null>(null);
+  const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [message, setMessage] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
   const socketRef = useRef<WebSocket | null>(null);
+  const videoUrlRef = useRef<string | null>(null);
 
-  useEffect(() => () => socketRef.current?.close(), []);
+  useEffect(() => () => {
+    socketRef.current?.close();
+    if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current);
+  }, []);
 
   const enterRoom = (
     roomId: string,
@@ -56,6 +64,7 @@ function App() {
   ) => {
     const self = { id: participantId, name: participantName };
     setActiveRoom(roomId);
+    setIsHost(false);
     setCurrentParticipant(self);
     setParticipants(roster.some((participant) => participant.id === participantId)
       ? roster
@@ -100,6 +109,7 @@ function App() {
         ? data.room.participants.filter(isParticipant)
         : [];
       enterRoom(data.room.id, data.participantId, "Host", roomParticipants);
+      setIsHost(data.room.hostId === data.participantId);
     } catch (error) {
       console.error(error);
       setMessage(error instanceof Error ? error.message : "Could not create room.");
@@ -134,6 +144,7 @@ function App() {
         ? data.room.participants.filter(isParticipant)
         : [];
       enterRoom(data.room.id, data.participantId, name.trim(), roomParticipants);
+      setIsHost(data.room.hostId === data.participantId);
     } catch (error) {
       console.error(error);
       setMessage(error instanceof Error ? error.message : "Could not join room.");
@@ -156,11 +167,41 @@ function App() {
   const leaveRoom = () => {
     socketRef.current?.close();
     socketRef.current = null;
+    if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current);
+    videoUrlRef.current = null;
+    setVideoUrl(null);
+    setSelectedVideo(null);
     setActiveRoom(null);
+    setIsHost(false);
     setCurrentParticipant(null);
     setParticipants([]);
     setIsConnected(false);
     setMessage("");
+  };
+
+  const selectVideo = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = "";
+    if (!file) return;
+
+    if (!/\.(mp4|webm|mov|mkv)$/i.test(file.name)) {
+      setMessage("Choose an MP4, WebM, MOV, or MKV video.");
+      return;
+    }
+
+    if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current);
+    const url = URL.createObjectURL(file);
+    videoUrlRef.current = url;
+    setSelectedVideo(file);
+    setVideoUrl(url);
+    setMessage("");
+  };
+
+  const clearVideo = () => {
+    if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current);
+    videoUrlRef.current = null;
+    setVideoUrl(null);
+    setSelectedVideo(null);
   };
 
   return (
@@ -271,17 +312,51 @@ function App() {
           <div className="watch-layout">
             <section className="watch-column">
               <div className="player-frame">
-                <div className="player-vignette" />
-                <div className="player-message">
-                  <div className="player-icon"><BrandMark /></div>
-                    <span className="player-kicker">YOUR PRIVATE WATCH ROOM</span>
-                    <h2>Your room is ready<br />for its first movie night.</h2>
-                    <p>Invite your friends with the room code and settle in together.</p>
-                    <button className="button button-player" onClick={copyRoomCode}>
-                      <span>↗</span> Copy room code
-                    </button>
-                  </div>
-                  <span className="player-live"><span /> ROOM READY</span>
+                {videoUrl ? (
+                  <>
+                    <video
+                      src={videoUrl}
+                      controls
+                      playsInline
+                      preload="metadata"
+                      aria-label={`Selected video: ${selectedVideo?.name ?? "local video"}`}
+                      style={{ width: "100%", height: "100%", position: "absolute", inset: 0, objectFit: "contain", background: "#08080d" }}
+                    />
+                    {isHost && selectedVideo && (
+                      <div style={{ position: "absolute", zIndex: 2, top: 16, right: 16, left: 16, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "8px 10px", border: "1px solid rgba(255,255,255,.12)", borderRadius: 8, background: "rgba(13,13,18,.82)" }}>
+                        <span title={selectedVideo.name} style={{ minWidth: 0, overflow: "hidden", color: "#eeeaf5", fontSize: 11, textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{selectedVideo.name}</span>
+                        <button className="invite-button" style={{ width: "auto", flex: "0 0 auto", margin: 0, padding: "7px 10px" }} onClick={clearVideo}>Clear video</button>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <div className="player-vignette" />
+                    <div className="player-message">
+                      <div className="player-icon"><BrandMark /></div>
+                      <span className="player-kicker">YOUR PRIVATE WATCH ROOM</span>
+                      <h2>Your room is ready<br />for its first movie night.</h2>
+                      <p>Invite your friends with the room code and settle in together.</p>
+                      {isHost ? (
+                        <label className="button button-player" style={{ cursor: "pointer" }}>
+                          <span>↑</span> Select video
+                          <input
+                            type="file"
+                            accept="video/mp4,video/webm,video/quicktime,video/x-matroska,.mp4,.webm,.mov,.mkv"
+                            onChange={selectVideo}
+                            aria-label="Select a video file"
+                            style={{ display: "none" }}
+                          />
+                        </label>
+                      ) : (
+                        <button className="button button-player" onClick={copyRoomCode}>
+                          <span>↗</span> Copy room code
+                        </button>
+                      )}
+                    </div>
+                    <span className="player-live"><span /> ROOM READY</span>
+                  </>
+                )}
               </div>
               {message && <p className="room-message" role="status">{message}</p>}
               <div className="watch-caption">
