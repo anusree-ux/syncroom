@@ -68,17 +68,19 @@ export async function roomSocket(app: FastifyInstance) {
             participant &&
             (data.type === "webrtc:offer" ||
               data.type === "webrtc:answer" ||
-              data.type === "webrtc:ice-candidate")
+              data.type === "webrtc:ice-candidate") &&
+            typeof data.to === "string"
           ) {
-            const signal = JSON.stringify({
-              ...data,
-              fromParticipantId: participant.participantId,
-            });
-
-            for (const client of connections) {
-              if (client.socket !== socket && client.socket.readyState === 1) {
-                client.socket.send(signal);
-              }
+            const target = [...connections].find(
+              (client) => client.participantId === data.to,
+            );
+            if (target && target.socket !== socket && target.socket.readyState === 1) {
+              target.socket.send(
+                JSON.stringify({
+                  ...data,
+                  from: participant.participantId,
+                })
+              );
             }
           }
         } catch {

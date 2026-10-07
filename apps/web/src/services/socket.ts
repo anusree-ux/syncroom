@@ -1,16 +1,22 @@
 export type RoomEvent = {
   type: string;
-  fromParticipantId?: string;
+  from?: string;
+  to?: string;
   offer?: RTCSessionDescriptionInit;
   answer?: RTCSessionDescriptionInit;
   candidate?: RTCIceCandidateInit;
   [key: string]: unknown;
 };
 
-export type WebRTCSignalMessage =
+export type WebRTCSignalPayload =
   | { type: "webrtc:offer"; offer: RTCSessionDescriptionInit }
   | { type: "webrtc:answer"; answer: RTCSessionDescriptionInit }
   | { type: "webrtc:ice-candidate"; candidate: RTCIceCandidateInit };
+
+export type WebRTCSignalMessage = WebRTCSignalPayload & {
+  from: string;
+  to: string;
+};
 
 export function connectToRoom(
   roomId: string,

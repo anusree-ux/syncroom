@@ -3,13 +3,18 @@ export type WebRTCCallbacks = {
   onTrack: (stream: MediaStream) => void;
 };
 
+export type PeerConnections = Map<string, RTCPeerConnection>;
+
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
 ];
 
 export function createPeerConnection(
+  participantId: string,
   callbacks: WebRTCCallbacks,
+  peerConnections: PeerConnections,
 ): RTCPeerConnection {
+  closePeerConnection(peerConnections, participantId);
   const peerConnection = new RTCPeerConnection({ iceServers: ICE_SERVERS });
   const receivedStream = new MediaStream();
 
@@ -30,7 +35,27 @@ export function createPeerConnection(
     callbacks.onTrack(receivedStream);
   };
 
+  peerConnections.set(participantId, peerConnection);
   return peerConnection;
+}
+
+export function closePeerConnection(
+  peerConnections: PeerConnections,
+  participantId: string,
+): void {
+  const peerConnection = peerConnections.get(participantId);
+  if (!peerConnection) return;
+
+  peerConnection.onicecandidate = null;
+  peerConnection.ontrack = null;
+  peerConnection.close();
+  peerConnections.delete(participantId);
+}
+
+export function closeAllPeerConnections(peerConnections: PeerConnections): void {
+  for (const participantId of peerConnections.keys()) {
+    closePeerConnection(peerConnections, participantId);
+  }
 }
 
 export async function createOffer(

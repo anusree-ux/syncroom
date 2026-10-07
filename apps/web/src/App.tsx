@@ -3,15 +3,18 @@ import {
   connectToRoom,
   sendWebRTCSignal,
   type RoomEvent,
-  type WebRTCSignalMessage,
+  type WebRTCSignalPayload,
 } from "./services/socket";
 import {
   acceptAnswer,
   acceptOffer,
   addIceCandidate,
+  closeAllPeerConnections,
+  closePeerConnection as removePeerConnection,
   createAnswer,
   createOffer,
   createPeerConnection,
+  type PeerConnections,
 } from "./services/webrtc";
 import "./App.css";
 
@@ -74,9 +77,8 @@ function App() {
   const socketRef = useRef<WebSocket | null>(null);
   const videoUrlRef = useRef<string | null>(null);
   const isHostRef = useRef(false);
-  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
-  const peerParticipantIdRef = useRef<string | null>(null);
-  const pendingIceCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  const peerConnectionsRef = useRef<PeerConnections>(new Map());
+  const pendingIceCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
   const capturedStreamRef = useRef<MediaStream | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -132,20 +134,25 @@ function App() {
     }
   };
 
-  const closePeerConnection = (clearRemoteStream = true) => {
-    peerConnectionRef.current?.close();
-    peerConnectionRef.current = null;
-    peerParticipantIdRef.current = null;
-    pendingIceCandidatesRef.current = [];
+  const cleanupPeerConnection = (participantId: string, clearRemoteStream = false) => {
+    removePeerConnection(peerConnectionsRef.current, participantId);
+    pendingIceCandidatesRef.current.delete(participantId);
     if (clearRemoteStream) {
       pendingPlaybackRef.current = {};
       setRemoteStream(null);
     }
   };
 
+  const cleanupAllPeerConnections = () => {
+    closeAllPeerConnections(peerConnectionsRef.current);
+    pendingIceCandidatesRef.current.clear();
+    pendingPlaybackRef.current = {};
+    setRemoteStream(null);
+  };
+
   useEffect(() => () => {
     socketRef.current?.close();
-    peerConnectionRef.current?.close();
+    closeAllPeerConnections(peerConnectionsRef.current);
     capturedStreamRef.current?.getTracks().forEach((track) => track.stop());
     if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current);
   }, []);
@@ -182,17 +189,17 @@ function App() {
     setMessage("");
     setIsConnected(false);
 
-    const sendSignal = (signal: WebRTCSignalMessage) => {
+    const sendSignal = (to: string, signal: WebRTCSignalPayload) => {
       const socket = socketRef.current;
       if (!socket) throw new Error("Room connection is not available.");
-      sendWebRTCSignal(socket, signal);
+      sendWebRTCSignal(socket, { ...signal, from: participantId, to });
     };
 
-    const createPeer = (remoteParticipantId: string, preservePendingIce = false) => {
-      const peerConnection = createPeerConnection({
+    const createPeer = (remoteParticipantId: string) => {
+      const peerConnection = createPeerConnection(remoteParticipantId, {
         onIceCandidate: (candidate) => {
           try {
-            sendSignal({ type: "webrtc:ice-candidate", candidate });
+            sendSignal(remoteParticipantId, { type: "webrtc:ice-candidate", candidate });
           } catch (error) {
             console.error("Could not send WebRTC ICE candidate:", error);
             setMessage("Couldn't send a video connection candidate.");
@@ -201,23 +208,26 @@ function App() {
         onTrack: (stream) => {
           if (!isHostRef.current) setRemoteStream(stream);
         },
-      });
-      peerConnectionRef.current = peerConnection;
-      peerParticipantIdRef.current = remoteParticipantId;
-      if (!preservePendingIce) pendingIceCandidatesRef.current = [];
+      }, peerConnectionsRef.current);
+      if (!pendingIceCandidatesRef.current.has(remoteParticipantId)) {
+        pendingIceCandidatesRef.current.set(remoteParticipantId, []);
+      }
       return peerConnection;
     };
 
-    const addPendingIceCandidates = async (peerConnection: RTCPeerConnection) => {
-      const candidates = pendingIceCandidatesRef.current;
-      pendingIceCandidatesRef.current = [];
+    const addPendingIceCandidates = async (
+      remoteParticipantId: string,
+      peerConnection: RTCPeerConnection,
+    ) => {
+      const candidates = pendingIceCandidatesRef.current.get(remoteParticipantId) ?? [];
+      pendingIceCandidatesRef.current.delete(remoteParticipantId);
       for (const candidate of candidates) {
         await addIceCandidate(peerConnection, candidate);
       }
     };
 
     const startHostOffer = async (remoteParticipantId: string) => {
-      if (peerConnectionRef.current) return;
+      if (peerConnectionsRef.current.has(remoteParticipantId)) return;
       const peerConnection = createPeer(remoteParticipantId);
       peerConnection.addTransceiver("video", { direction: "sendonly" });
       peerConnection.addTransceiver("audio", { direction: "sendonly" });
@@ -233,34 +243,32 @@ function App() {
       }
 
       const offer = await createOffer(peerConnection);
-      sendSignal({ type: "webrtc:offer", offer });
+      sendSignal(remoteParticipantId, { type: "webrtc:offer", offer });
     };
 
     const handleWebRTCEvent = async (event: RoomEvent) => {
+      if (!event.from || event.to !== participantId) return;
+      const remoteParticipantId = event.from;
+
       if (event.type === "webrtc:offer" && !isHostRef.current && event.offer) {
-        const remoteParticipantId = event.fromParticipantId;
+        if (peerConnectionsRef.current.has(remoteParticipantId)) return;
         if (!remoteParticipantId) throw new Error("WebRTC offer has no sender ID.");
-        if (peerConnectionRef.current && peerParticipantIdRef.current !== remoteParticipantId) return;
-        const peerConnection = peerConnectionRef.current ?? createPeer(remoteParticipantId, true);
+        const peerConnection = createPeer(remoteParticipantId);
         await acceptOffer(peerConnection, event.offer);
-        await addPendingIceCandidates(peerConnection);
+        await addPendingIceCandidates(remoteParticipantId, peerConnection);
         const answer = await createAnswer(peerConnection);
-        sendSignal({ type: "webrtc:answer", answer });
+        sendSignal(remoteParticipantId, { type: "webrtc:answer", answer });
       } else if (event.type === "webrtc:answer" && isHostRef.current && event.answer) {
-        const peerConnection = peerConnectionRef.current;
+        const peerConnection = peerConnectionsRef.current.get(remoteParticipantId);
         if (!peerConnection) return;
         await acceptAnswer(peerConnection, event.answer);
-        await addPendingIceCandidates(peerConnection);
+        await addPendingIceCandidates(remoteParticipantId, peerConnection);
       } else if (event.type === "webrtc:ice-candidate" && event.candidate) {
-        if (
-          event.fromParticipantId &&
-          peerParticipantIdRef.current &&
-          event.fromParticipantId !== peerParticipantIdRef.current
-        ) return;
-
-        const peerConnection = peerConnectionRef.current;
+        const peerConnection = peerConnectionsRef.current.get(remoteParticipantId);
         if (!peerConnection?.remoteDescription) {
-          pendingIceCandidatesRef.current.push(event.candidate);
+          const pending = pendingIceCandidatesRef.current.get(remoteParticipantId) ?? [];
+          pending.push(event.candidate);
+          pendingIceCandidatesRef.current.set(remoteParticipantId, pending);
         } else {
           await addIceCandidate(peerConnection, event.candidate);
         }
@@ -282,7 +290,7 @@ function App() {
           setParticipants((current) => current.some((participant) => participant.id === joined.id)
             ? current
             : [...current, joined]);
-          if (isHostRef.current && !peerConnectionRef.current) {
+          if (isHostRef.current && !peerConnectionsRef.current.has(joined.id)) {
             void startHostOffer(joined.id).catch((error: unknown) => {
               console.error("Could not start WebRTC offer:", error);
               setMessage(error instanceof Error ? error.message : "Couldn't start the video connection.");
@@ -292,7 +300,9 @@ function App() {
 
         if (event.type === "participant:left" && typeof event.participantId === "string") {
           setParticipants((current) => current.filter((participant) => participant.id !== event.participantId));
-          if (peerParticipantIdRef.current === event.participantId) closePeerConnection();
+          if (peerConnectionsRef.current.has(event.participantId)) {
+            cleanupPeerConnection(event.participantId, !isHostRef.current);
+          }
         }
 
         if (!isHostRef.current) {
@@ -394,7 +404,7 @@ function App() {
   const leaveRoom = () => {
     socketRef.current?.close();
     socketRef.current = null;
-    closePeerConnection();
+    cleanupAllPeerConnections();
     capturedStreamRef.current?.getTracks().forEach((track) => track.stop());
     capturedStreamRef.current = null;
     if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current);
@@ -420,8 +430,7 @@ function App() {
       return;
     }
 
-    const peerConnection = peerConnectionRef.current;
-    if (peerConnection) {
+    for (const peerConnection of peerConnectionsRef.current.values()) {
       for (const transceiver of peerConnection.getTransceivers()) {
         if (transceiver.sender.track) {
           void transceiver.sender.replaceTrack(null).catch((error: unknown) => {
@@ -441,8 +450,7 @@ function App() {
   };
 
   const clearVideo = () => {
-    const peerConnection = peerConnectionRef.current;
-    if (peerConnection) {
+    for (const peerConnection of peerConnectionsRef.current.values()) {
       for (const transceiver of peerConnection.getTransceivers()) {
         if (transceiver.sender.track) {
           void transceiver.sender.replaceTrack(null).catch((error: unknown) => {
@@ -471,13 +479,13 @@ function App() {
     try {
       const stream = capturableVideo.captureStream();
       capturedStreamRef.current = stream;
-      const peerConnection = peerConnectionRef.current;
-      if (!peerConnection) return;
-      for (const track of stream.getTracks()) {
-        const transceiver = peerConnection.getTransceivers().find(
-          (candidate) => candidate.receiver.track.kind === track.kind,
-        );
-        if (transceiver) await transceiver.sender.replaceTrack(track);
+      for (const peerConnection of peerConnectionsRef.current.values()) {
+        for (const track of stream.getTracks()) {
+          const transceiver = peerConnection.getTransceivers().find(
+            (candidate) => candidate.receiver.track.kind === track.kind,
+          );
+          if (transceiver) await transceiver.sender.replaceTrack(track);
+        }
       }
     } catch (error) {
       console.error("Could not capture the selected video stream:", error);
