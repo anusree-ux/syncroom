@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import type { WebSocket } from "ws";
+import { getRoom } from "../modules/rooms/room.service.js";
 
 type ParticipantConnection = {
   socket: WebSocket;
@@ -41,41 +42,89 @@ export async function roomSocket(app: FastifyInstance) {
           const data = JSON.parse(message.toString());
 
           if (data.type === "participant:join") {
+            const room = getRoom(roomId);
+            const returningParticipant = room?.participants.find(
+              (candidate) => candidate.id === data.participantId,
+            );
+            if (
+              !returningParticipant ||
+              typeof data.participantId !== "string" ||
+              typeof data.name !== "string"
+            ) {
+              socket.send(JSON.stringify({
+                type: "room:error",
+                message: "This participant is not registered in the room.",
+              }));
+              socket.close(1008, "Unknown room participant");
+              return;
+            }
+
+            const existingConnection = [...connections].find(
+              (client) => client.participantId === returningParticipant.id,
+            );
+            if (existingConnection?.socket === socket) {
+              participant = existingConnection;
+              return;
+            }
+            const previousConnection = existingConnection;
+            if (previousConnection) {
+              connections.delete(previousConnection);
+              for (const client of connections) {
+                if (client.socket.readyState === 1) {
+                  client.socket.send(JSON.stringify({
+                    type: "participant:left",
+                    participantId: previousConnection.participantId,
+                    name: previousConnection.name,
+                  }));
+                }
+              }
+            }
+
             participant = {
               socket,
-              participantId: data.participantId,
-              name: data.name,
+              participantId: returningParticipant.id,
+              name: returningParticipant.name,
             };
 
             connections.add(participant);
+            previousConnection?.socket.close(4001, "Participant reconnected");
 
-            console.log(
-              `${data.name} joined room ${roomId}`
-            );
+            console.log(`${participant.name} ${previousConnection ? "reconnected to" : "joined"} room ${roomId}`);
 
             for (const client of connections) {
               if (client.socket !== socket && client.socket.readyState === 1) {
                 client.socket.send(
                   JSON.stringify({
                     type: "participant:joined",
-                    participantId: data.participantId,
-                    name: data.name,
+                    participantId: participant.participantId,
+                    name: participant.name,
                   })
                 );
-                client.socket.send(
-                  JSON.stringify({
-                    type: "system:message",
-                    message: `${data.name} joined the room`,
-                    timestamp: Date.now(),
-                  })
-                );
+                if (!previousConnection) {
+                  client.socket.send(
+                    JSON.stringify({
+                      type: "system:message",
+                      message: `${participant.name} joined the room`,
+                      timestamp: Date.now(),
+                    })
+                  );
+                }
               }
             }
-            if (socket.readyState === 1) {
+            for (const client of connections) {
+              if (client.socket !== socket && client.socket.readyState === 1) {
+                socket.send(JSON.stringify({
+                  type: "participant:joined",
+                  participantId: client.participantId,
+                  name: client.name,
+                }));
+              }
+            }
+            if (!previousConnection && socket.readyState === 1) {
               socket.send(
                 JSON.stringify({
                   type: "system:message",
-                  message: `${data.name} joined the room`,
+                  message: `${participant.name} joined the room`,
                   timestamp: Date.now(),
                 })
               );
@@ -84,7 +133,10 @@ export async function roomSocket(app: FastifyInstance) {
             participant &&
             (data.type === "webrtc:offer" ||
               data.type === "webrtc:answer" ||
-              data.type === "webrtc:ice-candidate") &&
+              data.type === "webrtc:ice-candidate" ||
+              data.type === "voice:offer" ||
+              data.type === "voice:answer" ||
+              data.type === "voice:ice-candidate") &&
             typeof data.to === "string"
           ) {
             const target = [...connections].find(
@@ -130,8 +182,7 @@ export async function roomSocket(app: FastifyInstance) {
       });
 
       socket.on("close", () => {
-        if (participant) {
-          connections.delete(participant);
+        if (participant && connections.delete(participant)) {
 
           console.log(
             `${participant.name} left room ${roomId}`

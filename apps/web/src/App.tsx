@@ -3,6 +3,7 @@ import {
   connectToRoom,
   sendChatMessage,
   sendSystemMessage,
+  sendVoiceSignal,
   sendWebRTCSignal,
   type RoomEvent,
   type WebRTCSignalPayload,
@@ -17,7 +18,11 @@ import {
   createOffer,
   createPeerConnection,
   type PeerConnections,
+  VoicePeerManager,
+  type VoicePeerStatus,
+  type VoiceSignalPayload as WebRTCVoiceSignalPayload,
 } from "./services/webrtc";
+import { analyzeMedia, type MediaInfo } from "./services/media";
 import "./App.css";
 
 const API_URL = "http://localhost:5000";
@@ -26,6 +31,66 @@ type Participant = {
   id: string;
   name: string;
 };
+
+type RoomSession = {
+  roomId: string;
+  participantId: string;
+  name: string;
+  role: "host" | "viewer";
+  voiceMuted?: boolean;
+};
+
+const ROOM_SESSION_KEY = "syncroom_session";
+
+function readRoomSession(): RoomSession | null {
+  try {
+    const raw = sessionStorage.getItem(ROOM_SESSION_KEY);
+    if (!raw) return null;
+    const value: unknown = JSON.parse(raw);
+    if (!value || typeof value !== "object") return null;
+    const session = value as Record<string, unknown>;
+    if (
+      typeof session.roomId !== "string" ||
+      typeof session.participantId !== "string" ||
+      typeof session.name !== "string" ||
+      (session.role !== "host" && session.role !== "viewer")
+    ) return null;
+
+    return {
+      roomId: session.roomId,
+      participantId: session.participantId,
+      name: session.name,
+      role: session.role,
+      voiceMuted: typeof session.voiceMuted === "boolean" ? session.voiceMuted : false,
+    };
+  } catch (error) {
+    console.error("Could not read the saved room session:", error);
+    return null;
+  }
+}
+
+function saveRoomSession(session: RoomSession): boolean {
+  try {
+    sessionStorage.setItem(ROOM_SESSION_KEY, JSON.stringify(session));
+    return true;
+  } catch (error) {
+    console.error("Could not save the room session:", error);
+    return false;
+  }
+}
+
+function saveVoiceMuted(voiceMuted: boolean): void {
+  const session = readRoomSession();
+  if (session) saveRoomSession({ ...session, voiceMuted });
+}
+
+function clearRoomSession(): void {
+  try {
+    sessionStorage.removeItem(ROOM_SESSION_KEY);
+  } catch (error) {
+    console.error("Could not clear the saved room session:", error);
+  }
+}
 
 type PendingPlaybackState = {
   isPlaying?: boolean;
@@ -77,31 +142,95 @@ function BrandMark() {
   );
 }
 
+function RemoteAudio({ stream, participantName }: { stream: MediaStream; participantName: string }) {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+
+    audio.srcObject = stream;
+    void audio.play().catch((error: unknown) => {
+      console.error(`Could not play ${participantName}'s voice stream:`, error);
+    });
+    return () => {
+      audio.srcObject = null;
+    };
+  }, [participantName, stream]);
+
+  return <audio ref={audioRef} autoPlay aria-label={`${participantName}'s voice`} />;
+}
+
+function formatMediaDuration(duration: number): string {
+  const totalMinutes = Math.floor(duration / 60);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (totalMinutes > 0) return `${totalMinutes}m`;
+  return `${Math.floor(duration)}s`;
+}
+
+function getQualityOptions(mediaInfo: MediaInfo): string[] {
+  const lowerResolutions = [4320, 2160, 1440, 1080, 720, 480, 360]
+    .filter((height) => height < mediaInfo.height)
+    .map((height) => `${height}p`);
+  return ["Auto", mediaInfo.resolution, ...lowerResolutions.filter((quality) => quality !== mediaInfo.resolution)];
+}
+
 function App() {
+  const [initialSession] = useState(readRoomSession);
   const [roomCode, setRoomCode] = useState("");
-  const [name, setName] = useState("");
-  const [activeRoom, setActiveRoom] = useState<string | null>(null);
-  const [isHost, setIsHost] = useState(false);
-  const [currentParticipant, setCurrentParticipant] = useState<Participant | null>(null);
-  const [participants, setParticipants] = useState<Participant[]>([]);
+  const [name, setName] = useState(initialSession?.name ?? "");
+  const [activeRoom, setActiveRoom] = useState<string | null>(initialSession?.roomId ?? null);
+  const [isHost, setIsHost] = useState(initialSession?.role === "host");
+  const [currentParticipant, setCurrentParticipant] = useState<Participant | null>(
+    initialSession ? { id: initialSession.participantId, name: initialSession.name } : null,
+  );
+  const [participants, setParticipants] = useState<Participant[]>(
+    initialSession ? [{ id: initialSession.participantId, name: initialSession.name }] : [],
+  );
   const [selectedVideo, setSelectedVideo] = useState<File | null>(null);
+  const [mediaInfo, setMediaInfo] = useState<MediaInfo | null>(null);
+  const [isAnalyzingMedia, setIsAnalyzingMedia] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [settingsSection, setSettingsSection] = useState<"quality" | "audio" | "subtitles" | null>(null);
+  const [selectedQuality, setSelectedQuality] = useState("Auto");
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  const [voiceStatus, setVoiceStatus] = useState<"idle" | "requesting" | "ready" | "denied">("idle");
+  const [isVoiceMuted, setIsVoiceMuted] = useState(initialSession?.voiceMuted ?? false);
+  const [voicePeerStatuses, setVoicePeerStatuses] = useState<Record<string, VoicePeerStatus>>({});
+  const [remoteAudioStreams, setRemoteAudioStreams] = useState<Record<string, MediaStream>>({});
   const [chatMessages, setChatMessages] = useState<ChatItem[]>([]);
   const [chatDraft, setChatDraft] = useState("");
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const [message, setMessage] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
   const socketRef = useRef<WebSocket | null>(null);
   const videoUrlRef = useRef<string | null>(null);
+  const mediaAnalysisIdRef = useRef(0);
   const isHostRef = useRef(false);
   const peerConnectionsRef = useRef<PeerConnections>(new Map());
   const pendingIceCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
   const capturedStreamRef = useRef<MediaStream | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const watchStageRef = useRef<HTMLDivElement | null>(null);
   const chatMessagesEndRef = useRef<HTMLDivElement | null>(null);
   const pendingPlaybackRef = useRef<PendingPlaybackState>({});
+  const voiceManagerRef = useRef<VoicePeerManager | null>(null);
+  const voiceParticipantIdsRef = useRef<Set<string>>(new Set());
+  const startVoiceRef = useRef<(() => Promise<void>) | null>(null);
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(document.fullscreenElement === watchStageRef.current);
+    };
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", handleFullscreenChange);
+  }, []);
 
   const applyRemotePlayback = () => {
     const video = remoteVideoRef.current;
@@ -184,6 +313,7 @@ function App() {
   useEffect(() => () => {
     socketRef.current?.close();
     closeAllPeerConnections(peerConnectionsRef.current);
+    voiceManagerRef.current?.cleanup();
     capturedStreamRef.current?.getTracks().forEach((track) => track.stop());
     if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current);
   }, []);
@@ -210,19 +340,101 @@ function App() {
     roomId: string,
     participantId: string,
     participantName: string,
-    roster: Participant[],
     host: boolean,
   ) => {
     const self = { id: participantId, name: participantName };
+    const existingSession = readRoomSession();
+    const initialMuted = existingSession?.roomId === roomId &&
+      existingSession.participantId === participantId
+      ? existingSession.voiceMuted ?? false
+      : false;
+    const saved = saveRoomSession({
+      roomId,
+      participantId,
+      name: participantName,
+      role: host ? "host" : "viewer",
+      voiceMuted: initialMuted,
+    });
     setActiveRoom(roomId);
+    setName(participantName);
     setIsHost(host);
     isHostRef.current = host;
     setCurrentParticipant(self);
-    setParticipants(roster.some((participant) => participant.id === participantId)
-      ? roster
-      : [...roster, self]);
-    setMessage("");
+    setParticipants([self]);
+    voiceParticipantIdsRef.current.clear();
+    voiceManagerRef.current?.cleanup();
+    voiceManagerRef.current = null;
+    setVoiceStatus("idle");
+    setIsVoiceMuted(initialMuted);
+    setVoicePeerStatuses({});
+    setRemoteAudioStreams({});
+    setMessage(saved ? "" : "Room is open, but this tab couldn't save your session.");
     setIsConnected(false);
+
+    const initializeVoice = async () => {
+      if (voiceManagerRef.current) return;
+      const roomSocket = socketRef.current;
+      if (!roomSocket) return;
+      setVoiceStatus("requesting");
+      const manager = new VoicePeerManager({
+        onSignal: (remoteParticipantId, signal) => {
+          const socket = socketRef.current;
+          if (!socket || socket !== roomSocket) {
+            console.error("Cannot send voice signal: room connection is unavailable.");
+            return;
+          }
+          try {
+            sendVoiceSignal(socket, { ...signal, from: participantId, to: remoteParticipantId });
+          } catch (error) {
+            console.error("Could not send voice signal:", error);
+            setVoiceStatus("denied");
+          }
+        },
+        onRemoteStream: (remoteParticipantId, stream) => {
+          setRemoteAudioStreams((current) => {
+            if (!stream) {
+              const next = { ...current };
+              delete next[remoteParticipantId];
+              return next;
+            }
+            return { ...current, [remoteParticipantId]: stream };
+          });
+        },
+        onStatusChange: (remoteParticipantId, status) => {
+          setVoicePeerStatuses((current) => ({ ...current, [remoteParticipantId]: status }));
+        },
+      });
+      manager.setMuted(initialMuted);
+      voiceManagerRef.current = manager;
+
+      try {
+        await manager.initialize();
+        if (
+          socketRef.current !== roomSocket ||
+          roomSocket.readyState !== WebSocket.OPEN ||
+          voiceManagerRef.current !== manager
+        ) {
+          manager.cleanup();
+          if (voiceManagerRef.current === manager) voiceManagerRef.current = null;
+          if (socketRef.current === roomSocket) setVoiceStatus("idle");
+          return;
+        }
+        setVoiceStatus("ready");
+        for (const remoteParticipantId of voiceParticipantIdsRef.current) {
+          await manager.addParticipant(remoteParticipantId, participantId < remoteParticipantId);
+        }
+      } catch (error) {
+        console.error("Could not initialize room voice:", error);
+        manager.cleanup();
+        if (voiceManagerRef.current === manager) {
+          voiceManagerRef.current = null;
+          setVoiceStatus("denied");
+          setVoicePeerStatuses({});
+          setRemoteAudioStreams({});
+        }
+      }
+    };
+    startVoiceRef.current = initializeVoice;
 
     const sendSignal = (to: string, signal: WebRTCSignalPayload) => {
       const socket = socketRef.current;
@@ -320,11 +532,37 @@ function App() {
           return;
         }
 
+        if (event.type === "room:error") {
+          clearRoomSession();
+          socketRef.current?.close();
+          socketRef.current = null;
+          cleanupAllPeerConnections();
+          voiceManagerRef.current?.cleanup();
+          voiceManagerRef.current = null;
+          setActiveRoom(null);
+          setIsHost(false);
+          isHostRef.current = false;
+          setCurrentParticipant(null);
+          setParticipants([]);
+          setVoiceStatus("idle");
+          setVoicePeerStatuses({});
+          setRemoteAudioStreams({});
+          setMessage(typeof event.message === "string" ? event.message : "Could not reconnect to this room.");
+          return;
+        }
+
         if (event.type === "participant:joined" && typeof event.participantId === "string" && typeof event.name === "string") {
           const joined = { id: event.participantId, name: event.name };
+          voiceParticipantIdsRef.current.add(joined.id);
           setParticipants((current) => current.some((participant) => participant.id === joined.id)
             ? current
             : [...current, joined]);
+          const voiceManager = voiceManagerRef.current;
+          if (voiceManager) {
+            void voiceManager.addParticipant(joined.id, participantId < joined.id).catch((error: unknown) => {
+              console.error("Could not add voice participant:", error);
+            });
+          }
           if (isHostRef.current && !peerConnectionsRef.current.has(joined.id)) {
             void startHostOffer(joined.id).catch((error: unknown) => {
               console.error("Could not start WebRTC offer:", error);
@@ -334,9 +572,17 @@ function App() {
         }
 
         if (event.type === "participant:left" && typeof event.participantId === "string") {
-          setParticipants((current) => current.filter((participant) => participant.id !== event.participantId));
-          if (peerConnectionsRef.current.has(event.participantId)) {
-            cleanupPeerConnection(event.participantId, !isHostRef.current);
+          const leftParticipantId = event.participantId;
+          voiceParticipantIdsRef.current.delete(leftParticipantId);
+          voiceManagerRef.current?.removeParticipant(leftParticipantId);
+          setRemoteAudioStreams((current) => {
+            const next = { ...current };
+            delete next[leftParticipantId];
+            return next;
+          });
+          setParticipants((current) => current.filter((participant) => participant.id !== leftParticipantId));
+          if (peerConnectionsRef.current.has(leftParticipantId)) {
+            cleanupPeerConnection(leftParticipantId, !isHostRef.current);
           }
         }
 
@@ -393,9 +639,111 @@ function App() {
             setMessage(error instanceof Error ? error.message : "The video connection failed.");
           });
         }
+
+        if (
+          event.type.startsWith("voice:") &&
+          event.to === participantId &&
+          typeof event.from === "string"
+        ) {
+          const remoteParticipantId = event.from;
+          const voiceManager = voiceManagerRef.current;
+          if (!voiceManager) return;
+          let signal: WebRTCVoiceSignalPayload | null = null;
+          if (event.type === "voice:offer" && event.offer) {
+            signal = { type: "voice:offer", offer: event.offer };
+          } else if (event.type === "voice:answer" && event.answer) {
+            signal = { type: "voice:answer", answer: event.answer };
+          } else if (event.type === "voice:ice-candidate" && event.candidate) {
+            signal = { type: "voice:ice-candidate", candidate: event.candidate };
+          }
+          if (signal) {
+            void voiceManager.handleSignal(remoteParticipantId, signal).catch((error: unknown) => {
+              console.error("Voice signaling failed:", error);
+              setVoicePeerStatuses((current) => ({ ...current, [remoteParticipantId]: "failed" }));
+            });
+          }
+        }
       },
+      () => { void initializeVoice(); },
     );
   };
+
+  useEffect(() => {
+    if (!initialSession) return;
+
+    let cancelled = false;
+    const restoreSession = async () => {
+      try {
+        const response = await fetch(
+          `${API_URL}/api/rooms/${encodeURIComponent(initialSession.roomId)}`,
+        );
+
+        if (!response.ok) {
+          if (response.status === 404) {
+            clearRoomSession();
+            if (!cancelled) {
+              setActiveRoom(null);
+              setCurrentParticipant(null);
+              setParticipants([]);
+              setIsHost(false);
+              isHostRef.current = false;
+              setMessage("That room is no longer available. Create or join another room.");
+            }
+            return;
+          }
+          throw new Error("Could not restore the saved room.");
+        }
+
+        const room = await response.json() as RoomResponse["room"];
+        if (room.id !== initialSession.roomId) {
+          throw new Error("The saved room response did not match the requested room.");
+        }
+        const roomParticipants = Array.isArray(room.participants)
+          ? room.participants.filter(isParticipant)
+          : [];
+        const participant = roomParticipants.find((item) => item.id === initialSession.participantId);
+
+        if (!participant) {
+          clearRoomSession();
+          if (!cancelled) {
+            setActiveRoom(null);
+            setCurrentParticipant(null);
+            setParticipants([]);
+            setIsHost(false);
+            isHostRef.current = false;
+            setMessage("Your saved participant is no longer in this room. Join again to continue.");
+          }
+          return;
+        }
+
+        if (!cancelled) {
+          const host = room.hostId === initialSession.participantId;
+          enterRoom(
+            room.id,
+            initialSession.participantId,
+            participant.name || initialSession.name,
+            host,
+          );
+        }
+      } catch (error) {
+        console.error("Could not restore the saved room:", error);
+        if (!cancelled) {
+          enterRoom(
+            initialSession.roomId,
+            initialSession.participantId,
+            initialSession.name,
+            initialSession.role === "host",
+          );
+          setMessage("Couldn't refresh the room roster. Reconnecting with your saved identity.");
+        }
+      }
+    };
+
+    void restoreSession();
+    return () => {
+      cancelled = true;
+    };
+  }, [initialSession]);
 
   const createRoom = async () => {
     try {
@@ -406,10 +754,7 @@ function App() {
       if (!response.ok) throw new Error("Failed to create room. Please try again.");
 
       const data = await response.json() as RoomResponse;
-      const roomParticipants = Array.isArray(data.room.participants)
-        ? data.room.participants.filter(isParticipant)
-        : [];
-      enterRoom(data.room.id, data.participantId, "Host", roomParticipants, true);
+      enterRoom(data.room.id, data.participantId, "Host", true);
     } catch (error) {
       console.error(error);
       setMessage(error instanceof Error ? error.message : "Could not create room.");
@@ -440,10 +785,7 @@ function App() {
       const data = await response.json() as RoomResponse & { message?: string };
       if (!response.ok) throw new Error(data.message || "Failed to join room.");
 
-      const roomParticipants = Array.isArray(data.room.participants)
-        ? data.room.participants.filter(isParticipant)
-        : [];
-      enterRoom(data.room.id, data.participantId, name.trim(), roomParticipants, false);
+      enterRoom(data.room.id, data.participantId, name.trim(), false);
     } catch (error) {
       console.error(error);
       setMessage(error instanceof Error ? error.message : "Could not join room.");
@@ -464,24 +806,76 @@ function App() {
   };
 
   const leaveRoom = () => {
+    clearRoomSession();
+    mediaAnalysisIdRef.current++;
+    if (document.fullscreenElement === watchStageRef.current) {
+      void document.exitFullscreen().catch((error: unknown) => {
+        console.error("Could not exit fullscreen while leaving the room:", error);
+      });
+    }
     socketRef.current?.close();
     socketRef.current = null;
     cleanupAllPeerConnections();
+    voiceManagerRef.current?.cleanup();
+    voiceManagerRef.current = null;
+    voiceParticipantIdsRef.current.clear();
+    startVoiceRef.current = null;
     capturedStreamRef.current?.getTracks().forEach((track) => track.stop());
     capturedStreamRef.current = null;
     if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current);
     videoUrlRef.current = null;
     setVideoUrl(null);
     setSelectedVideo(null);
+    setMediaInfo(null);
+    setIsAnalyzingMedia(false);
+    setIsSettingsOpen(false);
+    setSettingsSection(null);
+    setSelectedQuality("Auto");
     setActiveRoom(null);
     setIsHost(false);
     isHostRef.current = false;
     setCurrentParticipant(null);
     setParticipants([]);
+    setVoiceStatus("idle");
+    setIsVoiceMuted(false);
+    setVoicePeerStatuses({});
+    setRemoteAudioStreams({});
     setChatMessages([]);
     setChatDraft("");
     setIsConnected(false);
     setMessage("");
+  };
+
+  const toggleVoiceMute = async () => {
+    let manager = voiceManagerRef.current;
+    if (!manager) {
+      await startVoiceRef.current?.();
+      manager = voiceManagerRef.current;
+      if (manager) {
+        setIsVoiceMuted(manager.isMuted());
+      }
+      return;
+    }
+
+    const muted = !manager.isMuted();
+    manager.setMuted(muted);
+    setIsVoiceMuted(muted);
+    saveVoiceMuted(muted);
+  };
+
+  const toggleFullscreen = async () => {
+    const container = watchStageRef.current;
+    if (!container) return;
+    try {
+      if (document.fullscreenElement === container) {
+        await document.exitFullscreen();
+      } else {
+        await container.requestFullscreen();
+      }
+    } catch (error) {
+      console.error("Could not toggle fullscreen:", error);
+      setMessage("Fullscreen isn't available in this browser.");
+    }
   };
 
   const submitChatMessage = (event: FormEvent<HTMLFormElement>) => {
@@ -509,6 +903,12 @@ function App() {
       return;
     }
 
+    const analysisId = ++mediaAnalysisIdRef.current;
+    setMediaInfo(null);
+    setIsAnalyzingMedia(true);
+    setIsSettingsOpen(false);
+    setSettingsSection(null);
+    setSelectedQuality("Auto");
     for (const peerConnection of peerConnectionsRef.current.values()) {
       for (const transceiver of peerConnection.getTransceivers()) {
         if (transceiver.sender.track) {
@@ -526,9 +926,28 @@ function App() {
     setSelectedVideo(file);
     setVideoUrl(url);
     setMessage("");
+    void analyzeMedia(file)
+      .then((info) => {
+        if (mediaAnalysisIdRef.current === analysisId) setMediaInfo(info);
+      })
+      .catch((error: unknown) => {
+        console.error("Could not analyze selected video:", error);
+        if (mediaAnalysisIdRef.current === analysisId) {
+          setMessage(error instanceof Error ? error.message : "Could not read the selected video's metadata.");
+        }
+      })
+      .finally(() => {
+        if (mediaAnalysisIdRef.current === analysisId) setIsAnalyzingMedia(false);
+      });
   };
 
   const clearVideo = () => {
+    mediaAnalysisIdRef.current++;
+    setMediaInfo(null);
+    setIsAnalyzingMedia(false);
+    setIsSettingsOpen(false);
+    setSettingsSection(null);
+    setSelectedQuality("Auto");
     for (const peerConnection of peerConnectionsRef.current.values()) {
       for (const transceiver of peerConnection.getTransceivers()) {
         if (transceiver.sender.track) {
@@ -609,7 +1028,7 @@ function App() {
               <div className="art-avatar avatar-one">J</div>
               <div className="art-avatar avatar-two">M</div>
               <div className="art-avatar avatar-three">A</div>
-            </div>
+              </div>
           </div>
 
           <section className="entry-card" aria-label="Create or join a room">
@@ -677,7 +1096,8 @@ function App() {
             </div>
           </div>
 
-          <div className="watch-layout">
+          <div ref={watchStageRef} className={`watch-stage${isFullscreen ? " is-fullscreen" : ""}`}>
+            <div className="watch-layout">
             <section className="watch-column">
               <div className="player-frame">
                 {isHost && videoUrl ? (
@@ -698,8 +1118,17 @@ function App() {
                       style={{ width: "100%", height: "100%", position: "absolute", inset: 0, objectFit: "contain", background: "#08080d" }}
                     />
                     {selectedVideo && (
-                      <div style={{ position: "absolute", zIndex: 2, top: 16, right: 16, left: 16, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "8px 10px", border: "1px solid rgba(255,255,255,.12)", borderRadius: 8, background: "rgba(13,13,18,.82)" }}>
-                        <span title={selectedVideo.name} style={{ minWidth: 0, overflow: "hidden", color: "#eeeaf5", fontSize: 11, textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{selectedVideo.name}</span>
+                      <div className="selected-video-info">
+                        <div className="selected-video-copy">
+                          <span className="selected-video-name" title={selectedVideo.name}>{selectedVideo.name}</span>
+                          <span className="selected-video-metadata">
+                            {isAnalyzingMedia
+                              ? "Analyzing media…"
+                              : mediaInfo
+                                ? `${mediaInfo.resolution} • ${formatMediaDuration(mediaInfo.duration)}`
+                                : "Media details unavailable"}
+                          </span>
+                        </div>
                         <button className="invite-button" style={{ width: "auto", flex: "0 0 auto", margin: 0, padding: "7px 10px" }} onClick={clearVideo}>Clear video</button>
                       </div>
                     )}
@@ -720,7 +1149,9 @@ function App() {
                       <div className="player-icon"><BrandMark /></div>
                       <span className="player-kicker">YOUR PRIVATE WATCH ROOM</span>
                       <h2>Your room is ready<br />for its first movie night.</h2>
-                      <p>Invite your friends with the room code and settle in together.</p>
+                      <p>{isHost
+                        ? "Your selected video isn't available after a refresh. Select it again to resume sharing."
+                        : "Invite your friends with the room code and settle in together."}</p>
                       {isHost ? (
                         <label className="button button-player" style={{ cursor: "pointer" }}>
                           <span>↑</span> Select video
@@ -741,6 +1172,141 @@ function App() {
                     <span className="player-live"><span /> ROOM READY</span>
                   </>
                 )}
+                <div className="player-toolbar">
+                  <span className="stage-people-count" aria-label={`${participants.length} people in room`} title={`${participants.length} people in room`}>
+                    <span aria-hidden="true">👤</span><span>{participants.length}</span>
+                  </span>
+                  <button
+                    className={`stage-control-button voice-icon-button${isVoiceMuted ? " is-muted" : ""}${voiceStatus === "denied" ? " is-unavailable" : ""}`}
+                    onClick={() => void toggleVoiceMute()}
+                    aria-label={isVoiceMuted ? "Unmute microphone" : "Mute microphone"}
+                    title={voiceStatus === "denied" ? "Retry microphone access" : isVoiceMuted ? "Unmute microphone" : "Mute microphone"}
+                  >
+                    {isVoiceMuted ? "🔇" : "🎤"}
+                  </button>
+                  <button
+                    className="stage-control-button chat-toggle"
+                    onClick={() => {
+                      setIsChatOpen((open) => !open);
+                      setIsSettingsOpen(false);
+                    }}
+                    aria-expanded={isChatOpen}
+                    aria-label={isChatOpen ? "Close chat" : "Open chat"}
+                  >
+                    💬{chatMessages.length > 0 && <span className="chat-unread-dot" />}
+                  </button>
+                  {isHost && videoUrl && (
+                    <button
+                      className={`stage-control-button settings-toggle${isSettingsOpen ? " is-active" : ""}`}
+                      onClick={() => {
+                        setIsSettingsOpen((open) => !open);
+                        setIsChatOpen(false);
+                        setSettingsSection(null);
+                      }}
+                      aria-label="Video settings"
+                      aria-expanded={isSettingsOpen}
+                      title="Video settings"
+                    >
+                      ⚙
+                    </button>
+                  )}
+                  <button className="stage-control-button fullscreen-toggle" onClick={() => void toggleFullscreen()}>
+                    {isFullscreen ? "Exit" : "⛶ Fullscreen"}
+                  </button>
+                </div>
+                {isSettingsOpen && isHost && videoUrl && (
+                  <section className="settings-menu" aria-label="Video settings">
+                    {settingsSection === null ? (
+                      <>
+                        <h2>Settings</h2>
+                        <button className="settings-menu-item" onClick={() => setSettingsSection("quality")}>
+                          <span>Quality</span><span aria-hidden="true">›</span>
+                        </button>
+                        <button className="settings-menu-item" onClick={() => setSettingsSection("audio")}>
+                          <span>Audio</span><span aria-hidden="true">›</span>
+                        </button>
+                        <button className="settings-menu-item" onClick={() => setSettingsSection("subtitles")}>
+                          <span>Subtitles</span><span aria-hidden="true">›</span>
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <button className="settings-menu-back" onClick={() => setSettingsSection(null)}>
+                          <span aria-hidden="true">‹</span> Settings
+                        </button>
+                        <h2>{settingsSection === "quality" ? "Quality" : settingsSection === "audio" ? "Audio" : "Subtitles"}</h2>
+                        {settingsSection === "quality" ? (
+                          mediaInfo ? getQualityOptions(mediaInfo).map((quality) => (
+                            <button
+                              className="settings-menu-item settings-quality-item"
+                              key={quality}
+                              onClick={() => setSelectedQuality(quality)}
+                            >
+                              <span className="settings-quality-check">{selectedQuality === quality ? "✓" : ""}</span>
+                              <span>{quality}</span>
+                            </button>
+                          )) : (
+                            <p className="settings-unavailable">{isAnalyzingMedia ? "Analyzing video…" : "Video quality is unavailable."}</p>
+                          )
+                        ) : (
+                          <p className="settings-unavailable">Coming soon</p>
+                        )}
+                      </>
+                    )}
+                  </section>
+                )}
+                <section className={`chat-panel${isChatOpen ? " chat-panel-open" : ""}`} aria-label="Room chat" aria-hidden={!isChatOpen}>
+                  <div className="chat-heading">
+                    <div><h2>Chat</h2></div>
+                    <button className="chat-close" onClick={() => setIsChatOpen(false)} aria-label="Close chat" tabIndex={isChatOpen ? 0 : -1}>×</button>
+                  </div>
+                  <div className="chat-messages" aria-live="polite" aria-relevant="additions">
+                    {chatMessages.length === 0 ? (
+                      <p className="chat-empty">No messages yet. Start the conversation!</p>
+                    ) : chatMessages.map((item, index) => item.type === "system:message" ? (
+                      <div className="chat-system-message" key={`${item.timestamp}-${index}`}>
+                        <span className="chat-system-sender">System</span>
+                        <p>{item.message}</p>
+                      </div>
+                    ) : (
+                      <div
+                        className={`chat-message${item.senderId === currentParticipant?.id ? " chat-message-own" : ""}`}
+                        key={`${item.timestamp}-${index}`}
+                      >
+                        <span className="chat-sender">{item.senderName}</span>
+                        <p>{item.message}</p>
+                        <time dateTime={new Date(item.timestamp).toISOString()}>
+                          {new Date(item.timestamp).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
+                        </time>
+                      </div>
+                    ))}
+                    <div ref={chatMessagesEndRef} />
+                  </div>
+                  <form className="chat-form" onSubmit={submitChatMessage}>
+                    <input
+                      type="text"
+                      aria-label="Chat message"
+                      placeholder="Write a message..."
+                      value={chatDraft}
+                      onChange={(event) => setChatDraft(event.target.value)}
+                      maxLength={1000}
+                      autoComplete="off"
+                      tabIndex={isChatOpen ? 0 : -1}
+                    />
+                    <button type="submit" disabled={!chatDraft.trim()} aria-label="Send message" tabIndex={isChatOpen ? 0 : -1}>
+                      <span>Send</span><span aria-hidden="true">↑</span>
+                    </button>
+                  </form>
+                </section>
+                <div className="remote-audio-streams" aria-hidden="true">
+                  {Object.entries(remoteAudioStreams).map(([participantId, stream]) => (
+                    <RemoteAudio
+                      key={participantId}
+                      stream={stream}
+                      participantName={participants.find((participant) => participant.id === participantId)?.name ?? "Participant"}
+                    />
+                  ))}
+                </div>
               </div>
               {message && <p className="room-message" role="status">{message}</p>}
               <div className="watch-caption">
@@ -759,6 +1325,17 @@ function App() {
                   <div className="participant-row" key={participant.id}>
                     <span className={`participant-avatar avatar-color-${index % 5}`}>{participant.name.trim().charAt(0).toUpperCase() || "?"}</span>
                     <span className="participant-name">{participant.name}{participant.id === currentParticipant?.id && <span className="you-label">YOU</span>}</span>
+                    <span
+                      className={`voice-indicator${participant.id === currentParticipant?.id
+                        ? isVoiceMuted ? " voice-muted" : voiceStatus === "ready" ? " voice-connected" : ""
+                        : voicePeerStatuses[participant.id] === "connected" ? " voice-connected" : ""}`}
+                      title={participant.id === currentParticipant?.id
+                        ? isVoiceMuted ? "Microphone muted" : voiceStatus === "ready" ? "Microphone on" : "Microphone unavailable"
+                        : voicePeerStatuses[participant.id] === "connected" ? "Voice connected" : "Voice connecting"}
+                      aria-label={participant.id === currentParticipant?.id && isVoiceMuted ? "Microphone muted" : "Voice status"}
+                    >
+                      {participant.id === currentParticipant?.id && isVoiceMuted ? "×" : "🎤"}
+                    </span>
                     <span className="participant-online" aria-label="In room" />
                   </div>
                 ))}
@@ -771,48 +1348,8 @@ function App() {
                 <button className="invite-button" onClick={copyRoomCode}>Copy invite code <span>→</span></button>
               </div>
               <div className="room-security"><span>♢</span> Only people with your code can join.</div>
-              <section className="chat-panel" aria-label="Room chat">
-                <div className="chat-heading">
-                  <div><h2>Room chat</h2><p>Say hello to your watch party</p></div>
-                  <span className="chat-heading-icon" aria-hidden="true">✦</span>
-                </div>
-                <div className="chat-messages" aria-live="polite" aria-relevant="additions">
-                  {chatMessages.length === 0 ? (
-                    <p className="chat-empty">No messages yet. Start the conversation!</p>
-                  ) : chatMessages.map((item, index) => item.type === "system:message" ? (
-                    <div className="chat-system-message" key={`${item.timestamp}-${index}`}>
-                      <span>{item.message}</span>
-                    </div>
-                  ) : (
-                    <div
-                      className={`chat-message${item.senderId === currentParticipant?.id ? " chat-message-own" : ""}`}
-                      key={`${item.timestamp}-${index}`}
-                    >
-                      <span className="chat-sender">{item.senderName}</span>
-                      <p>{item.message}</p>
-                      <time dateTime={new Date(item.timestamp).toISOString()}>
-                        {new Date(item.timestamp).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
-                      </time>
-                    </div>
-                  ))}
-                  <div ref={chatMessagesEndRef} />
-                </div>
-                <form className="chat-form" onSubmit={submitChatMessage}>
-                  <input
-                    type="text"
-                    aria-label="Chat message"
-                    placeholder="Write a message..."
-                    value={chatDraft}
-                    onChange={(event) => setChatDraft(event.target.value)}
-                    maxLength={1000}
-                    autoComplete="off"
-                  />
-                  <button type="submit" disabled={!chatDraft.trim()} aria-label="Send message">
-                    <span>Send</span><span aria-hidden="true">↑</span>
-                  </button>
-                </form>
-              </section>
             </aside>
+          </div>
           </div>
           <footer className="room-footer"><span><BrandMark /> syncroom</span><span>Made for being together, wherever.</span></footer>
         </section>

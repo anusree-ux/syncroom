@@ -10,6 +10,7 @@ export type RoomEvent = {
   offer?: RTCSessionDescriptionInit;
   answer?: RTCSessionDescriptionInit;
   candidate?: RTCIceCandidateInit;
+  voice?: boolean;
   [key: string]: unknown;
 };
 
@@ -22,6 +23,16 @@ export type WebRTCSignalMessage = WebRTCSignalPayload & {
   from: string;
   to: string;
 };
+
+export type VoiceSignalMessage = VoiceSignalPayload & {
+  from: string;
+  to: string;
+};
+
+export type VoiceSignalPayload =
+  | { type: "voice:offer"; offer: RTCSessionDescriptionInit }
+  | { type: "voice:answer"; answer: RTCSessionDescriptionInit }
+  | { type: "voice:ice-candidate"; candidate: RTCIceCandidateInit };
 
 export type ChatMessagePayload = {
   type: "chat:message";
@@ -37,7 +48,8 @@ export function connectToRoom(
   roomId: string,
   participantId: string,
   name: string,
-  onMessage: (event: RoomEvent) => void
+  onMessage: (event: RoomEvent) => void,
+  onOpen?: () => void,
 ) {
   const socket = new WebSocket(
     `ws://localhost:5000/ws/rooms/${roomId}`
@@ -53,6 +65,7 @@ export function connectToRoom(
         name,
       })
     );
+    onOpen?.();
   };
 
   socket.onmessage = (event) => {
@@ -81,6 +94,17 @@ export function sendWebRTCSignal(
 ) {
   if (socket.readyState !== WebSocket.OPEN) {
     throw new Error("Cannot send WebRTC signal: room connection is not open.");
+  }
+
+  socket.send(JSON.stringify(message));
+}
+
+export function sendVoiceSignal(
+  socket: WebSocket,
+  message: VoiceSignalMessage,
+): void {
+  if (socket.readyState !== WebSocket.OPEN) {
+    throw new Error("Cannot send voice signal: room connection is not open.");
   }
 
   socket.send(JSON.stringify(message));
