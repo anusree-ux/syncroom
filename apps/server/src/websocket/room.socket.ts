@@ -62,7 +62,23 @@ export async function roomSocket(app: FastifyInstance) {
                     name: data.name,
                   })
                 );
+                client.socket.send(
+                  JSON.stringify({
+                    type: "system:message",
+                    message: `${data.name} joined the room`,
+                    timestamp: Date.now(),
+                  })
+                );
               }
+            }
+            if (socket.readyState === 1) {
+              socket.send(
+                JSON.stringify({
+                  type: "system:message",
+                  message: `${data.name} joined the room`,
+                  timestamp: Date.now(),
+                })
+              );
             }
           } else if (
             participant &&
@@ -81,6 +97,31 @@ export async function roomSocket(app: FastifyInstance) {
                   from: participant.participantId,
                 })
               );
+            }
+          } else if (
+            participant &&
+            (data.type === "chat:message" || data.type === "system:message") &&
+            typeof data.message === "string" &&
+            data.message.trim().length > 0
+          ) {
+            const payload = JSON.stringify(
+              data.type === "chat:message"
+                ? {
+                    type: "chat:message",
+                    senderId: participant.participantId,
+                    senderName: participant.name,
+                    message: data.message.trim().slice(0, 1000),
+                    timestamp: Date.now(),
+                  }
+                : {
+                    type: "system:message",
+                    message: data.message.trim().slice(0, 500),
+                    timestamp: Date.now(),
+                  }
+            );
+
+            for (const client of connections) {
+              if (client.socket.readyState === 1) client.socket.send(payload);
             }
           }
         } catch {
@@ -103,6 +144,13 @@ export async function roomSocket(app: FastifyInstance) {
                   type: "participant:left",
                   participantId: participant.participantId,
                   name: participant.name,
+                })
+              );
+              client.socket.send(
+                JSON.stringify({
+                  type: "system:message",
+                  message: `${participant.name} left the room`,
+                  timestamp: Date.now(),
                 })
               );
             }

@@ -1,6 +1,8 @@
-import { useEffect, useRef, useState, type ChangeEvent } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
 import {
   connectToRoom,
+  sendChatMessage,
+  sendSystemMessage,
   sendWebRTCSignal,
   type RoomEvent,
   type WebRTCSignalPayload,
@@ -29,6 +31,20 @@ type PendingPlaybackState = {
   isPlaying?: boolean;
   currentTime?: number;
 };
+
+type ChatItem =
+  | {
+      type: "chat:message";
+      senderId: string;
+      senderName: string;
+      message: string;
+      timestamp: number;
+    }
+  | {
+      type: "system:message";
+      message: string;
+      timestamp: number;
+    };
 
 type VideoElementWithCaptureStream = HTMLVideoElement & {
   captureStream?: () => MediaStream;
@@ -71,6 +87,8 @@ function App() {
   const [selectedVideo, setSelectedVideo] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  const [chatMessages, setChatMessages] = useState<ChatItem[]>([]);
+  const [chatDraft, setChatDraft] = useState("");
   const [message, setMessage] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
@@ -82,6 +100,7 @@ function App() {
   const capturedStreamRef = useRef<MediaStream | null>(null);
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const chatMessagesEndRef = useRef<HTMLDivElement | null>(null);
   const pendingPlaybackRef = useRef<PendingPlaybackState>({});
 
   const applyRemotePlayback = () => {
@@ -128,10 +147,22 @@ function App() {
       : { type };
     try {
       socket.send(JSON.stringify(event));
+      const systemMessage = type === "playback:play"
+        ? "Host played the video"
+        : type === "playback:pause"
+          ? "Host paused the video"
+          : `Host skipped to ${formatPlaybackTime(currentTime ?? 0)}`;
+      sendSystemMessage(socket, systemMessage);
     } catch (error) {
       console.error(`Could not send ${type}:`, error);
       setMessage("Playback could not sync because the room connection failed.");
     }
+  };
+
+  const formatPlaybackTime = (time: number): string => {
+    const seconds = Math.max(0, Math.floor(time));
+    const minutes = Math.floor(seconds / 60);
+    return `${String(minutes).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
   };
 
   const cleanupPeerConnection = (participantId: string, clearRemoteStream = false) => {
@@ -170,6 +201,10 @@ function App() {
       video.srcObject = null;
     };
   }, [remoteStream]);
+
+  useEffect(() => {
+    chatMessagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [chatMessages]);
 
   const enterRoom = (
     roomId: string,
@@ -305,6 +340,33 @@ function App() {
           }
         }
 
+        if (
+          event.type === "chat:message" &&
+          typeof event.senderId === "string" &&
+          typeof event.senderName === "string" &&
+          typeof event.message === "string"
+        ) {
+          const senderId = event.senderId;
+          const senderName = event.senderName;
+          const chatMessage = event.message;
+          setChatMessages((current) => [...current, {
+            type: "chat:message",
+            senderId,
+            senderName,
+            message: chatMessage,
+            timestamp: typeof event.timestamp === "number" ? event.timestamp : Date.now(),
+          }]);
+        }
+
+        if (event.type === "system:message" && typeof event.message === "string") {
+          const systemMessage = event.message;
+          setChatMessages((current) => [...current, {
+            type: "system:message",
+            message: systemMessage,
+            timestamp: typeof event.timestamp === "number" ? event.timestamp : Date.now(),
+          }]);
+        }
+
         if (!isHostRef.current) {
           if (event.type === "playback:play") {
             pendingPlaybackRef.current = { ...pendingPlaybackRef.current, isPlaying: true };
@@ -416,8 +478,25 @@ function App() {
     isHostRef.current = false;
     setCurrentParticipant(null);
     setParticipants([]);
+    setChatMessages([]);
+    setChatDraft("");
     setIsConnected(false);
     setMessage("");
+  };
+
+  const submitChatMessage = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const content = chatDraft.trim();
+    const socket = socketRef.current;
+    if (!content || !socket) return;
+
+    try {
+      sendChatMessage(socket, content);
+      setChatDraft("");
+    } catch (error) {
+      console.error("Could not send chat message:", error);
+      setMessage(error instanceof Error ? error.message : "Could not send chat message.");
+    }
   };
 
   const selectVideo = (event: ChangeEvent<HTMLInputElement>) => {
@@ -692,6 +771,47 @@ function App() {
                 <button className="invite-button" onClick={copyRoomCode}>Copy invite code <span>→</span></button>
               </div>
               <div className="room-security"><span>♢</span> Only people with your code can join.</div>
+              <section className="chat-panel" aria-label="Room chat">
+                <div className="chat-heading">
+                  <div><h2>Room chat</h2><p>Say hello to your watch party</p></div>
+                  <span className="chat-heading-icon" aria-hidden="true">✦</span>
+                </div>
+                <div className="chat-messages" aria-live="polite" aria-relevant="additions">
+                  {chatMessages.length === 0 ? (
+                    <p className="chat-empty">No messages yet. Start the conversation!</p>
+                  ) : chatMessages.map((item, index) => item.type === "system:message" ? (
+                    <div className="chat-system-message" key={`${item.timestamp}-${index}`}>
+                      <span>{item.message}</span>
+                    </div>
+                  ) : (
+                    <div
+                      className={`chat-message${item.senderId === currentParticipant?.id ? " chat-message-own" : ""}`}
+                      key={`${item.timestamp}-${index}`}
+                    >
+                      <span className="chat-sender">{item.senderName}</span>
+                      <p>{item.message}</p>
+                      <time dateTime={new Date(item.timestamp).toISOString()}>
+                        {new Date(item.timestamp).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
+                      </time>
+                    </div>
+                  ))}
+                  <div ref={chatMessagesEndRef} />
+                </div>
+                <form className="chat-form" onSubmit={submitChatMessage}>
+                  <input
+                    type="text"
+                    aria-label="Chat message"
+                    placeholder="Write a message..."
+                    value={chatDraft}
+                    onChange={(event) => setChatDraft(event.target.value)}
+                    maxLength={1000}
+                    autoComplete="off"
+                  />
+                  <button type="submit" disabled={!chatDraft.trim()} aria-label="Send message">
+                    <span>Send</span><span aria-hidden="true">↑</span>
+                  </button>
+                </form>
+              </section>
             </aside>
           </div>
           <footer className="room-footer"><span><BrandMark /> syncroom</span><span>Made for being together, wherever.</span></footer>

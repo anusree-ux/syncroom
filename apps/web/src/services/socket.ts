@@ -2,6 +2,11 @@ export type RoomEvent = {
   type: string;
   from?: string;
   to?: string;
+  senderId?: string;
+  senderName?: string;
+  message?: string;
+  timestamp?: number;
+  currentTime?: number;
   offer?: RTCSessionDescriptionInit;
   answer?: RTCSessionDescriptionInit;
   candidate?: RTCIceCandidateInit;
@@ -16,6 +21,16 @@ export type WebRTCSignalPayload =
 export type WebRTCSignalMessage = WebRTCSignalPayload & {
   from: string;
   to: string;
+};
+
+export type ChatMessagePayload = {
+  type: "chat:message";
+  message: string;
+};
+
+export type SystemMessagePayload = {
+  type: "system:message";
+  message: string;
 };
 
 export function connectToRoom(
@@ -69,4 +84,28 @@ export function sendWebRTCSignal(
   }
 
   socket.send(JSON.stringify(message));
+}
+
+export function sendChatMessage(
+  socket: WebSocket,
+  message: string,
+): void {
+  if (socket.readyState !== WebSocket.OPEN) {
+    throw new Error("Cannot send chat message: room connection is not open.");
+  }
+
+  const payload: ChatMessagePayload = { type: "chat:message", message };
+  socket.send(JSON.stringify(payload));
+}
+
+export function sendSystemMessage(
+  socket: WebSocket,
+  message: string,
+): void {
+  if (socket.readyState !== WebSocket.OPEN) {
+    throw new Error("Cannot send system message: room connection is not open.");
+  }
+
+  const payload: SystemMessagePayload = { type: "system:message", message };
+  socket.send(JSON.stringify(payload));
 }
